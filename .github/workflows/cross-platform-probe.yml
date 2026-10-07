@@ -1,0 +1,254 @@
+name: cross-platform-path-probe
+
+# 只在手动触发时运行，不占用 CI 时间
+# On-demand only: never runs automatically
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to test (要测试的分支，默认是 PR #10312 的分支)'
+        required: true
+        default: 'fix/upgrade-path-and-redirect-validation'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+
+    steps:
+      - name: 检出被测分支 / Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 1
+
+      - name: 安装 .NET SDK / Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: 打印被检出的提交 / Show checked-out commit
+        shell: bash
+        run: |
+          echo "branch: ${{ github.event.inputs.branch }}"
+          git log -1 --pretty='commit %H%n author %an%n date %ad%n title %s'
+
+      - name: 生成探针工程 / Generate probe project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p probe
+
+          cat > probe/probe.csproj <<'EOF'
+          <Project Sdk="Microsoft.NET.Sdk">
+            <PropertyGroup>
+              <OutputType>Exe</OutputType>
+              <TargetFramework>net10.0</TargetFramework>
+              <ImplicitUsings>enable</ImplicitUsings>
+              <Nullable>disable</Nullable>
+              <AssemblyName>probe</AssemblyName>
+              <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
+              <InvariantGlobalization>true</InvariantGlobalization>
+            </PropertyGroup>
+            <ItemGroup>
+              <Compile Include="Program.cs" />
+              <Compile Include="../v2rayN/AmazTool/Utils.cs" />
+            </ItemGroup>
+          </Project>
+          EOF
+
+          cat > probe/Program.cs <<'EOF'
+          // 在真实操作系统上调用补丁里的真实函数 Utils.TryGetEntryPath
+          using System.Runtime.InteropServices;
+          using System.Text;
+          using AmazTool;
+
+          internal static class Probe
+          {
+              // 与 UpgradeApp.Upgrade 调用点一致的预处理（这几行是既有逻辑，非补丁新增）
+              private static string StripFirstSegment(string entryFullName)
+              {
+                  const string splitKey = "/";
+                  var lst = entryFullName.Split(splitKey);
+                  if (lst.Length == 1) return null; // 调用点此时 continue，不进入校验
+                  return string.Join(splitKey, lst[1..lst.Length]);
+              }
+
+              private static void Main()
+              {
+                  Console.OutputEncoding = Encoding.UTF8;
+
+                  Console.WriteLine("== 环境 / Environment ==");
+                  Console.WriteLine("OS        : " + RuntimeInformation.OSDescription);
+                  Console.WriteLine("Arch      : " + RuntimeInformation.ProcessArchitecture);
+                  Console.WriteLine(".NET      : " + Environment.Version);
+                  Console.WriteLine("DirSep    : '" + Path.DirectorySeparatorChar + "'");
+                  Console.WriteLine("installDir: " + Utils.StartupPath());
+                  Console.WriteLine();
+
+                  var cases = new (string Name, string Note)[]
+                  {
+                      ("normal.txt",                       "plain file"),
+                      ("sub/dir/file.txt",                 "nested path"),
+                      ("v2rayN",                           "Linux/macOS main binary"),
+                      ("libHarfBuzzSharp.so",              "Linux library"),
+                      ("v2rayN.app/Contents/MacOS/v2rayN", "macOS bundle binary"),
+                      ("conf:backup.json",                 "POSIX-legal name with colon"),
+                      ("logs/2026-10-07T16:30:45.log",     "POSIX-legal name with colon"),
+                      ("weird\\name.txt",                  "POSIX-legal name with backslash"),
+                      ("../etc/passwd",                    "attack: relative traversal"),
+                      ("../../../../tmp/x",                "attack: deep traversal"),
+                      ("a/b/../../../../x",                "attack: mixed traversal"),
+                      ("a\\..\\..\\..\\x",                 "attack: backslash traversal"),
+                      ("/etc/passwd",                      "attack: POSIX absolute"),
+                      ("C:\\Windows\\System32\\x",         "attack: Windows absolute"),
+                      ("\\\\server\\share\\x",             "attack: UNC"),
+                      ("file.txt:ads",                     "attack: NTFS ADS"),
+                      (".",                                "edge: single dot"),
+                      ("..",                               "edge: double dot"),
+                  };
+
+                  Console.WriteLine("== 一、TryGetEntryPath 逐条结果 / per-entry results ==");
+                  Console.WriteLine();
+                  Console.WriteLine("| entry | verdict | reason | result path |");
+                  Console.WriteLine("| --- | --- | --- | --- |");
+                  foreach (var c in cases)
+                  {
+                      string verdict, reason, path;
+                      try
+                      {
+                          var ok = Utils.TryGetEntryPath(c.Name, out var p, out var r);
+                          verdict = ok ? "ACCEPT" : "REJECT";
+                          reason = r;
+                          path = p;
+                      }
+                      catch (Exception ex)
+                      {
+                          verdict = "THROW";
+                          reason = ex.GetType().Name;
+                          path = "";
+                      }
+                      Console.WriteLine("| `" + c.Name + "` | " + verdict + " | " + reason + " | `" + path + "` |");
+                  }
+                  Console.WriteLine();
+
+                  Console.WriteLine("== 二、按调用点预处理后再校验 / after call-site preprocessing ==");
+                  Console.WriteLine();
+                  Console.WriteLine("| raw entry in zip | after strip | verdict | reason |");
+                  Console.WriteLine("| --- | --- | --- | --- |");
+                  var raw = new[]
+                  {
+                      "v2rayN-7.25.5/normal.txt",
+                      "v2rayN-7.25.5/conf:backup.json",
+                      "v2rayN-7.25.5/weird\\name.txt",
+                      "v2rayN-7.25.5/../../../etc/passwd",
+                      "v2rayN-7.25.5//etc/passwd",
+                      "noSlashEntry",
+                  };
+                  foreach (var r0 in raw)
+                  {
+                      var stripped = StripFirstSegment(r0);
+                      if (stripped == null)
+                      {
+                          Console.WriteLine("| `" + r0 + "` | (skipped) | - | pre-existing continue branch |");
+                          continue;
+                      }
+                      var ok2 = Utils.TryGetEntryPath(stripped, out _, out var r2);
+                      Console.WriteLine("| `" + r0 + "` | `" + stripped + "` | " + (ok2 ? "ACCEPT" : "REJECT") + " | " + r2 + " |");
+                  }
+                  Console.WriteLine();
+
+                  Console.WriteLine("== 三、文件名合法性对照（决定性）/ filename legality ==");
+                  Console.WriteLine();
+                  Console.WriteLine("判定方法：写入后看【目录列表里是否出现同名条目】");
+                  Console.WriteLine("  · 出现同名条目   → 该名字在本平台是合法的独立文件名");
+                  Console.WriteLine("  · 未出现同名条目 → 该名字被解释成了别的结构");
+                  Console.WriteLine("                     (Windows: ':' 变成 ADS、'\\' 变成目录分隔符)");
+                  Console.WriteLine();
+                  foreach (var n in new[] { "conf:backup.json", "weird\\name.txt" })
+                  {
+                      var dir = Path.Combine(Path.GetTempPath(), "fs_probe_" + Guid.NewGuid().ToString("N"));
+                      Directory.CreateDirectory(dir);
+                      try
+                      {
+                          var fp = Path.Combine(dir, n);
+                          var parent = Path.GetDirectoryName(fp);
+                          if (!string.IsNullOrEmpty(parent)) Directory.CreateDirectory(parent);
+
+                          File.WriteAllText(fp, "probe");
+
+                          // 只看【文件名】而不是相对路径：
+                          //   若用相对路径，"weird\name.txt" 在 Windows 上会因路径字符串恰好等于输入名而误判
+                          var listed = Directory.GetFiles(dir, "*", SearchOption.AllDirectories)
+                                                .Select(p => Path.GetFileName(p))
+                                                .OrderBy(p => p)
+                                                .ToList();
+                          var exact = listed.Any(x => x == n);
+
+                          Console.WriteLine("- name: `" + n + "`");
+                          Console.WriteLine("    dir listing: [" + string.Join(", ", listed) + "]");
+                          Console.WriteLine("    verdict: " + (exact
+                              ? "★ SAME-NAME FILE EXISTS -> legal filename on this platform"
+                              : "★ NO SAME-NAME FILE -> interpreted as something else"));
+                      }
+                      catch (Exception ex)
+                      {
+                          Console.WriteLine("- name: `" + n + "`");
+                          Console.WriteLine("    verdict: write failed -> " + ex.GetType().Name);
+                      }
+                      finally
+                      {
+                          try { Directory.Delete(dir, true); } catch { }
+                      }
+                  }
+                  Console.WriteLine();
+                  Console.WriteLine("预期 / expected:");
+                  Console.WriteLine("  windows-latest : conf:backup.json -> NO same-name file (ADS); weird\\name.txt -> split");
+                  Console.WriteLine("  ubuntu-latest  : both -> SAME-NAME FILE EXISTS (POSIX legal)");
+                  Console.WriteLine("  macos-latest   : both -> SAME-NAME FILE EXISTS (POSIX legal)");
+                  Console.WriteLine();
+
+                  Console.WriteLine("== 四、IsNonPublicHost 重点用例 / redirect-guard host cases ==");
+                  Console.WriteLine();
+                  foreach (var h in new[] { "localhost", "localhost.", "0.0.0.0", "::", "100.64.0.1", "::ffff:10.0.0.1", "172.32.0.1" })
+                  {
+                      var isIp = System.Net.IPAddress.TryParse(h, out _);
+                      Console.WriteLine("- " + h + " -> " + (isIp ? "parses as IP literal" : "not an IP literal"));
+                  }
+              }
+          }
+          EOF
+
+      - name: 运行探针 / Run probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet run --project probe -c Release --nologo 2>&1 | tee probe-output.txt
+
+      - name: 写入运行摘要 / Write job summary
+        if: always()
+        shell: bash
+        run: |
+          # 用 ~~~ 作为围栏，避免在 YAML 里出现三连反引号
+          {
+            echo "## ${{ matrix.os }}"
+            echo ""
+            echo '~~~'
+            cat probe-output.txt 2>/dev/null || echo "(no output)"
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 上传结果 / Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.os }}
+          path: probe-output.txt
+          if-no-files-found: warn
